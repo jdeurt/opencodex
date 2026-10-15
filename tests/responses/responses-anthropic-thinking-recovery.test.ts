@@ -1,3 +1,5 @@
+import { captureAnthropicRejectionPayloads, bindAnthropicRejectionResponse } from "../../src/adapters/anthropic-rejection-memo";
+import { createTranslatorBudget } from "../../src/lib/translator-budget";
 import { afterEach, expect, test } from "bun:test";
 import type { AdapterEvent, OcxParsedRequest } from "../../src/types";
 import { createAnthropicThinkingRecovery, isAnthropicThinkingSignatureBindingRejectionMessage } from "../../src/server/responses/anthropic-thinking-recovery";
@@ -23,6 +25,17 @@ async function collect(events: AsyncIterable<AdapterEvent>): Promise<AdapterEven
   const result: AdapterEvent[] = [];
   for await (const event of events) result.push(event);
   return result;
+}
+function httpRejection(message = MESSAGE): Response {
+  const response = Response.json({ error: { message } }, { status: 400 });
+  const request = { url: "https://example.test", method: "POST", headers: {}, body: "" };
+  const budget = createTranslatorBudget();
+  captureAnthropicRejectionPayloads(request, { messages: [{ role: "assistant", content: [
+    { type: "thinking", signature: "SyntheticSignature123456==" },
+  ] }] }, budget);
+  bindAnthropicRejectionResponse(request, response);
+  budget.dispose();
+  return response;
 }
 function fixture() {
   const request = parsed();
@@ -103,7 +116,7 @@ test("provider, missing state, pre-stripped and spent guards cannot arm recovery
 test("redacted-only history qualifies, and HTTP success alone does not memoize", async () => {
   const { recovery, request } = fixture();
   request.context.messages = [{ role: "assistant", content: [{ type: "thinking", thinking: "", redacted: ["synthetic-redacted"] }] }];
-  expect(await recovery.prepareHttp(Response.json({ error: { message: MESSAGE } }, { status: 400 }), "anthropic")).toBe(true);
+  expect(await recovery.prepareHttp(httpRejection(), "anthropic")).toBe(true);
   recovery.rememberSuccess({ status: "completed", output: [{ type: "message" }] });
   expect(reasoningReplayOpaqueBlobRejectionMemoized(request._reasoningReplayScope)).toBe(false);
   await collect(recovery.wrap(stream(success), () => { throw new Error("unexpected retry"); }, () => "anthropic"));

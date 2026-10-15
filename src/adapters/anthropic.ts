@@ -1,3 +1,4 @@
+import { captureAnthropicRejectionPayloads, keepAnthropicReplayBlock } from "./anthropic-rejection-memo";
 import { anthropicDeclaredTools } from "./anthropic-tool-catalog";
 import { anthropicReplayContent, createAnthropicReplayCapture } from "./anthropic-replay";
 import type { IncomingMeta, ProviderAdapter } from "./base";
@@ -780,9 +781,6 @@ function messagesToAnthropicFormat(
             if (text) preface.push({ type: "text", text });
           } else if (part.type === "thinking") {
             const t = part as OcxThinkingContent;
-            // History minted under another serving identity (or already rejected as opaque) is not
-            // this destination's to verify: drop its opaque blocks, as the Responses passthrough does.
-            if (parsed._stripReasoningEncryptedContent === true) continue;
             // Redacted blocks replay verbatim FIRST (they preceded the visible thinking block
             // in the original stream order preserved by the bridge envelope).
             for (const data of t.redacted ?? []) {
@@ -817,9 +815,7 @@ function messagesToAnthropicFormat(
             throw new Error("Anthropic search replay tool identity changed");
           }
         }
-        const content = captured
-          ? captured.filter(block => parsed._stripReasoningEncryptedContent !== true || (block.type !== "thinking" && block.type !== "redacted_thinking"))
-          : [...preface, ...toolUses];
+        const content = (captured ?? [...preface, ...toolUses]).filter(block => keepAnthropicReplayBlock(parsed, block as Record<string, unknown>));
         if (content.length === 0) break;
         messages.push({ role: "assistant", content });
         if (toolUseIds.length > 0) {
@@ -1181,7 +1177,7 @@ export function createAnthropicAdapter(provider: OcxProviderConfig, cacheRetenti
       enforceCacheControlLimit(body, explicitLimit);
       normalizeTtlOrdering(body);
 
-      return {
+      const request = {
         url,
         method: "POST",
         headers,
@@ -1195,6 +1191,8 @@ export function createAnthropicAdapter(provider: OcxProviderConfig, cacheRetenti
           fastSpeed?.value ?? null,
         ),
       };
+      captureAnthropicRejectionPayloads(request, body, incoming?.translatorBudget);
+      return request;
     },
 
     async *parseStream(
@@ -1396,8 +1394,13 @@ export function createAnthropicAdapter(provider: OcxProviderConfig, cacheRetenti
                 break;
               }
               case "error": {
-                const err = data.error as { message?: string } | undefined;
-                yield { type: "error", message: err?.message ?? "Anthropic error" };
+                const err = data.error as { message?: unknown; type?: unknown; code?: unknown; status?: unknown } | undefined;
+                yield { type: "error", message: typeof err?.message === "string" ? err.message : "Anthropic error",
+                  ...(typeof err?.type === "string" ? { errorType: err.type } : {}),
+                  ...(typeof err?.code === "string" ? { code: err.code } : {}),
+                  ...(typeof err?.status === "number" && Number.isInteger(err.status) && err.status >= 400 && err.status <= 599
+                    ? { status: err.status } : {}),
+                };
                 return;
               }
         }

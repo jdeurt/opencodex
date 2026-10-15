@@ -1,3 +1,4 @@
+import { bindAnthropicRejectionResponse } from "../../adapters/anthropic-rejection-memo";
 import { deferPhysicalSendReporter } from "./deferred-send-reporter";
 import { spendLedgerStorageErrorResponse } from "./spend-storage-error";
 import { classifyAnthropic429 } from "../../oauth/anthropic-rate-limit-policy";
@@ -929,6 +930,7 @@ export async function prepareAdapterExchange(
           return await sanitizeNonReplayableUpstreamError(upstreamResponse, upstream.signal);
         } finally { cleanupUpstreamAbort(); }
       }
+      bindAnthropicRejectionResponse(transportState.sameTargetRequest, upstreamResponse);
       if (await thinkingSignatureRecovery.prepareHttp(
         upstreamResponse, transportState.activeAdapter.name,
       )) {
@@ -1904,6 +1906,7 @@ export async function prepareAdapterExchange(
     }
   }
 
+  bindAnthropicRejectionResponse(transportState.sameTargetRequest, upstreamResponse);
   cancelBodyOnAbort(upstreamResponse.body, upstream.signal);
 
   return {

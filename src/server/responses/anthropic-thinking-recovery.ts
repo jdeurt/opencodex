@@ -1,3 +1,4 @@
+import { anthropicRejectionPolicy, bindAnthropicRejectionPolicy, rejectedAnthropicPayloads } from "../../adapters/anthropic-rejection-memo";
 import { normalizeUpstreamErrorText, readDisplaySafeErrorText } from "./core-errors";
 import { sanitizeNonReplayableUpstreamError } from "./non-replayable-error";
 import { isLikelyRealAnthropicThinkingSignature } from "../../adapters/anthropic";
@@ -29,22 +30,38 @@ export function createAnthropicThinkingRecovery(
   canRetry: () => boolean,
 ) {
   let rejectedScope: OcxParsedRequest["_reasoningReplayScope"];
+  let rejectedPayloads: ReadonlySet<string> | undefined;
   let armed = false;
   let outputSeen = false;
   let completed = false;
   let failed = false;
   let remembered = false;
 
-  const prepare = (message: string, adapterName: string, attempt = parsed): boolean => {
+  const prepare = (message: string, adapterName: string, attempt = parsed, response?: Response): boolean => {
     if (signal.aborted || !canRetry() || adapterName !== "anthropic" || guard.attempted
       || parsed._stripReasoningEncryptedContent === true || !carriesThinkingState(attempt)
       || !isAnthropicThinkingSignatureBindingRejectionMessage(message)) return false;
+    rejectedPayloads = rejectedAnthropicPayloads(response);
+    // A real send must prove that it serialized opaque history; otherwise rebuilding could
+    // repeat the same request. Direct event-policy callers have no HTTP body to identify.
+    if (response && !rejectedPayloads?.size) return false;
+    const previous = anthropicRejectionPolicy(parsed);
+    if (rejectedPayloads && previous?.mode === "selective") {
+      const merged = new Set(previous.fingerprints);
+      for (const payload of rejectedPayloads) merged.add(payload);
+      rejectedPayloads = merged.size <= 256 ? merged : undefined;
+    }
     guard.attempted = true;
     armed = true;
     const scope = parsed._reasoningReplayScope;
     rejectedScope = scope ? { ...scope, current: scope.current ? { ...scope.current } : undefined } : undefined;
-    prepareOpaqueBlobRecovery(parsed);
-    if (attempt !== parsed) prepareOpaqueBlobRecovery(attempt);
+    if (!rejectedPayloads) {
+      prepareOpaqueBlobRecovery(parsed);
+      if (attempt !== parsed) prepareOpaqueBlobRecovery(attempt);
+    }
+    const policy = rejectedPayloads ? { mode: "selective" as const, fingerprints: rejectedPayloads } : { mode: "blanket" as const };
+    bindAnthropicRejectionPolicy(parsed, policy);
+    bindAnthropicRejectionPolicy(attempt, policy);
     return true;
   };
 
@@ -56,7 +73,7 @@ export function createAnthropicThinkingRecovery(
       const body = await readBoundedResponseBody(response.clone(), { signal });
       if (!body.displaySafe || body.truncated) return false;
       const message = upstreamErrorMessageFromPayload(JSON.parse(body.text) as unknown);
-      return typeof message === "string" && prepare(message, adapterName, attempt);
+      return typeof message === "string" && prepare(message, adapterName, attempt, response);
     } catch {
       return false;
     }
@@ -74,6 +91,8 @@ export function createAnthropicThinkingRecovery(
     retry: () => AsyncIterable<AdapterEvent>,
     adapterName: () => string,
     replayAllowed = true,
+    response?: Response,
+    attempt = parsed,
   ): AsyncGenerator<AdapterEvent> {
     let source = events;
     let replaySafe = replayAllowed;
@@ -85,7 +104,7 @@ export function createAnthropicThinkingRecovery(
           const next = await iterator.next();
           if (next.done) return;
           const event = next.value;
-          if (replaySafe && event.type === "error" && prepare(event.message, adapterName())) {
+          if (replaySafe && event.type === "error" && prepare(event.message, adapterName(), attempt, response)) {
             // Close the rejected body before acquiring another dispatch/pacing slot.
             await iterator.return?.();
             source = retry();
@@ -113,7 +132,7 @@ export function createAnthropicThinkingRecovery(
       || rejectedScope.clientThreadId !== parsed._reasoningReplayScope?.clientThreadId
       || JSON.stringify(rejectedScope.current) !== JSON.stringify(parsed._reasoningReplayScope?.current)) return;
     remembered = true;
-    rememberReasoningReplayOpaqueBlobRejection(rejectedScope);
+    rememberReasoningReplayOpaqueBlobRejection(rejectedScope, rejectedPayloads);
   };
   // The search owner supplies only a fully validated current iteration, never search-card output.
   const observeIteration = (events: readonly AdapterEvent[]): void => {

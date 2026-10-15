@@ -113,7 +113,7 @@ export async function deliverAdapterResponse(
         yield { type: "error", message: "Upstream recovery response body stalled before completing",
           status: 504, errorType: "upstream_error" };
       }
-    }, () => transportState.activeAdapter.name, !isNonReplayableResponse(upstreamResponse));
+    }, () => transportState.activeAdapter.name, !isNonReplayableResponse(upstreamResponse), upstreamResponse);
 
 
 
