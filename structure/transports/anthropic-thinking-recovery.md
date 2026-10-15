@@ -13,15 +13,23 @@ same opaque-recovery guard and the existing request send budget, pacing and rebu
 Only harmless heartbeats may precede a streamed recovery: text, thinking, boundaries, tool
 activity and replay-unsafe heartbeats fence replay. The rejected iterator closes before refetch.
 
-Recovery uses the existing opaque-state strip/drop flags and leaves plaintext history intact.
+Recovery records only digests of the opaque blocks actually serialized by the adapter, using
+`src/adapters/anthropic-rejection-memo.ts`. The request-local policy removes those blocks and
+leaves plaintext history and newly issued thinking intact. If bounded collection is unavailable, recovery is withheld rather than risking a byte-identical resend.
 A replacement HTTP refusal retains its status, safe error message/type and code; its body is
 not parsed as SSE. Cancellation, budget exhaustion and a second rejection cannot trigger another
-signature recovery. No Anthropic `runTurn` or continuation recovery is introduced.
+signature recovery. Empty-completion retries in `src/server/responses/adapter-continuation.ts` share this guard and
+rebuild through their existing pacing/send owner. Ordinary continuations after output cannot
+recover signatures. Anthropic has no `runTurn` recovery.
 
 Only a delivery-validated completed response with actual text/tool output and an observed
 successful terminal can memoize the rejection. Errors, incomplete/empty responses, missing
 terminals, cancellation and changed serving identity cannot memoize it. The existing thread and
-durable-serving-identity key and five-minute TTL are unchanged.
+durable-serving-identity key and five-minute TTL in `src/responses/reasoning-replay-cache.ts` are
+unchanged. Selective memos retain at most 256 payload digests within the existing cache byte cap;
+merged sets that cannot fit fall back to the existing blanket policy. `src/server/responses/core-replay.ts`
+binds a memo only for the current serving scope; a serving-identity change retains its independent
+blanket strip. No prefix hashes or local prefix validator participate in replay admission.
 
 `tests/responses/responses-anthropic-thinking-signature-recovery.test.ts` exercises the actual
 Anthropic adapter with synthetic HTTP/SSE; `tests/responses/responses-anthropic-thinking-recovery.test.ts`
@@ -35,8 +43,8 @@ that block, so a genuine empty thinking-block start remains a separate signed bl
 
 `src/server/responses/sidecar-execution.ts` supplies the same request-owned policy to
 `src/web-search/loop.ts`. Only the current routed-model iteration is rebuilt; completed searches,
-tool results, and history remain intact. Request caches are invalidated and the root strip flags
-persist into later iterations. HTTP 400 classification runs after existing 429/key recovery.
+tool results, and history remain intact. Request caches are invalidated and the rejection policy
+persists into later iterations. HTTP 400 classification runs after existing 429/key recovery.
 `src/web-search/progress-stream.ts` has an opt-in typed adapter-error handoff before its normal
 exception conversion, with a per-send semantic/replay-unsafe fence and original-body cleanup.
 A streamed replacement gets a fresh header deadline; an HTTP refusal retains its current deadline.
@@ -86,3 +94,17 @@ existing empty-answer policy. Hosted search disabled by the incoming choice rema
 indices, bounded admission, forged/expired snapshot rejection and idempotent budget release.
 Nonconforming or repeated tool IDs fail before search execution, including IDs already present
 in the request-local history, rather than waiting for the next serializer to reject normalization.
+
+## Image/video model iterations
+
+`src/images/loop.ts` uses the same request-scoped recovery supplied by
+`src/server/responses/sidecar-execution.ts`. Both HTTP 400 and initial stream refusals rebuild
+only the current model send. Completed media calls and their tool results remain in loop history;
+recovery cannot repeat a media fulfillment. The loop keeps its pacing slot and fresh replacement
+header deadline. Replacement failures retain status/type/code and release unused permits.
+As in search, enforced spend without authoritative earlier-send receipts withholds recovery.
+
+`tests/responses/responses-anthropic-thinking-signature-recovery.test.ts` covers media repair,
+completed tool retention, progress fences, and empty-completion recovery. Legal oldest-thinking
+removal, changed system prompts on Sonnet 4.5 tool continuations, and rotating image URLs remain
+upstream decisions, covered by `tests/responses/responses-anthropic-legal-history.test.ts`.
