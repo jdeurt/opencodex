@@ -21,7 +21,7 @@ import {
   runWithImageBridge,
   clampImageMaxRounds,
 } from "../../images";
-import type { ProviderAdapter } from "../../adapters/base";
+import type { AdapterRequest, ProviderAdapter } from "../../adapters/base";
 import type { OcxParsedRequest } from "../../types";
 import { rotateProviderTransportOn429, rateLimitRetryPolicyFor } from "../../providers/key-failover";
 import {
@@ -378,7 +378,7 @@ export async function executeResponsesSidecars(
       recoveryKind = "oauth-account-429";
       if (!options.comboInitialSend && canRunWebSearch && route.providerName === "google-antigravity")
         sendBudgetState.pendingHopPermit = hop.permit;
-      else sidecarBudget.ownCredentialHop(hop.permit, canRunWebSearch && transportState.adapter.name === "anthropic");
+      else sidecarBudget.ownCredentialHop(hop.permit, (canRunWebSearch || !!imgPlan || !!vidPlan) && transportState.adapter.name === "anthropic");
     } else if (
       // Anthropic's pool is excluded from generic failover, so without this arm a 429 inside a
       // web-search or image-bridge turn was terminal even with the pool fully enabled -- while
@@ -419,7 +419,7 @@ export async function executeResponsesSidecars(
         return null;
       }
       recoveryKind = originalResponse?.status === 401 ? "oauth-401" : "anthropic-oauth-429";
-      sidecarBudget.ownCredentialHop(hop.permit, canRunWebSearch && transportState.adapter.name === "anthropic");
+      sidecarBudget.ownCredentialHop(hop.permit, (canRunWebSearch || !!imgPlan || !!vidPlan) && transportState.adapter.name === "anthropic");
     } else {
       // No key pool, no generic OAuth roster, no Anthropic pool could produce a replacement
       // credential. The 429 is terminal for this sidecar turn.
@@ -452,6 +452,35 @@ export async function executeResponsesSidecars(
     });
     return { adapter: rotatedAdapter, recoveryKind };
   };
+  // One guard follows the active sidecar across all iterations. Enforced spend has no
+  // authoritative receipt for earlier legacy sends, so recovery cannot claim headroom there.
+  const thinkingRecovery = createAnthropicThinkingRecovery(parsed,
+    options.abortSignal ?? new AbortController().signal, { attempted: false },
+    () => !sendBudgetState.sendBudgetExhausted()
+      && !!sendBudgetState.adapterDispatchBudget
+      && sendBudgetState.adapterDispatchBudget.spendEnforced !== true);
+  const thinkingReceipt = (request: AdapterRequest, adapter: ProviderAdapter, recovery?: AttemptRecoveryKind) =>
+    adapter.name !== "anthropic" ? {} : { onPhysicalDispatch: () => {
+      if (recovery === "opaque-blob-rejection") {
+        const decision = sendBudgetState.adapterDispatchBudget?.reserveDispatch({
+          sendClass: "repair", targetKey: `${route.providerName}|${request.url}|${route.modelId}`,
+        });
+        if (sendBudgetState.adapterDispatchBudget?.spendEnforced || !decision?.allowed) {
+          if (decision?.allowed) decision.permit.release();
+          throw new SendBudgetExhaustedError("sidecar thinking recovery");
+        }
+        try { sendBudgetState.noteInitialDispatch(decision.permit); }
+        finally { decision.permit.release(); }
+      } else {
+        const existing = sidecarBudget.fetchOptions(adapter).onPhysicalDispatch;
+        if (existing) existing();
+        else {
+          const prepaid = sendBudgetState.pendingHopPermit;
+          sendBudgetState.pendingHopPermit = undefined;
+          sendBudgetState.noteInitialDispatch(prepaid);
+        }
+      }
+    } };
   if ((imgPlan || vidPlan) && wsPlan) {
     // Web search takes priority when both are active — the media bridge cannot run
     // alongside runWithWebSearch. Surface a runtime signal so the user knows their
@@ -509,6 +538,7 @@ export async function executeResponsesSidecars(
     );
     const imgResponse = await runWithImageBridge({
       parsed, adapter: transportState.adapter,
+      ...(transportState.adapter.name === "anthropic" ? { thinkingRecovery } : {}),
       incomingMeta: { headers: requestState.selectedForwardHeaders, providerName: route.providerName, abortSignal: options.abortSignal, translatorBudget, ...(options.comboInitialSend ? { providerFetch: imageProviderFetch } : {}), ...sidecarBudget.incomingMeta },
       onProducerStart: sidecarBudget.takeProducerOwnership,
       onProducerEnd: sidecarBudget.release,
@@ -528,10 +558,11 @@ export async function executeResponsesSidecars(
       stallTimeoutSec: config.stallTimeoutSec,
       waitForRequestSlot: imageProviderFetch.waitForPacing,
       fetchImpl: imageProviderFetch.unpacedFetch ?? imageProviderFetch,
-      fetchForRequest: (request, iterParsed, adapter) => {
+      fetchForRequest: (request, iterParsed, adapter, recovery) => {
         const fetch = providerFetch(route.provider, options.codexWsRuntimeIdentity, {
           dispatchOverride: oauthDispatch(request, iterParsed),
           providerName: route.providerName, modelId: route.modelId, ...sidecarBudget.fetchOptions(adapter),
+          ...thinkingReceipt(request, adapter, recovery),
         });
         return fetch.unpacedFetch ?? fetch;
       },
@@ -555,6 +586,7 @@ export async function executeResponsesSidecars(
       onFirstOutput: noteSidecarOutput,
       ...(options.forceEmptyResponseId ? { forceEmptyResponseId: true } : {}),
       onCompletedResponse: (response, providerState) => {
+        if (!options.abortSignal?.aborted) thinkingRecovery.rememberSuccess(response);
         const served = transportState.replayOAuthCredentialSnapshot;
         if (route.providerName === "kiro" && response.status === "completed" && served
           && noteKiroServedSuccess(served.accountId, served.generation)) persistKiroAccountState();
@@ -593,13 +625,6 @@ export async function executeResponsesSidecars(
   // Placed BEFORE the runTurn early-return for non-runTurn adapters so dual-tool turns dispatch
   // through web-search instead of being swallowed. runTurn adapters never enter this branch.
   if (canRunWebSearch && wsPlan) {
-    // The legacy direct-search lane has no authoritative receipt for earlier sends under
-    // enforced spend. Fail closed for recovery there instead of granting unproven headroom.
-    const thinkingRecovery = createAnthropicThinkingRecovery(parsed,
-      options.abortSignal ?? new AbortController().signal, { attempted: false },
-      () => !sendBudgetState.sendBudgetExhausted()
-        && !!sendBudgetState.adapterDispatchBudget
-        && sendBudgetState.adapterDispatchBudget.spendEnforced !== true);
     parsed.context.tools = [...(parsed.context.tools ?? []), buildWebSearchTool()];
     // Resolve the mutable route at send time: a 429 rotation replaces route.provider, so retaining
     // one pre-rotation providerFetch would keep the old credential and transport pin.
@@ -616,25 +641,7 @@ export async function executeResponsesSidecars(
       fetchForRequest: (request, iterParsed, adapter, recovery) => providerFetch(route.provider, options.codexWsRuntimeIdentity, {
         dispatchOverride: oauthDispatch(request, iterParsed),
         providerName: route.providerName, modelId: route.modelId, ...sidecarBudget.fetchOptions(adapter),
-        ...(adapter.name === "anthropic" ? { onPhysicalDispatch: () => {
-          if (recovery === "opaque-blob-rejection") {
-            if (sendBudgetState.adapterDispatchBudget?.spendEnforced) throw new SendBudgetExhaustedError("web-search thinking recovery");
-            const decision = sendBudgetState.adapterDispatchBudget?.reserveDispatch({
-              sendClass: "repair", targetKey: `${route.providerName}|${request.url}|${route.modelId}`,
-            });
-            if (!decision?.allowed) throw new SendBudgetExhaustedError("web-search thinking recovery");
-            try { sendBudgetState.noteInitialDispatch(decision.permit); }
-            finally { decision.permit.release(); }
-          } else {
-            const existing = sidecarBudget.fetchOptions(adapter).onPhysicalDispatch;
-            if (existing) existing();
-            else {
-              const prepaid = sendBudgetState.pendingHopPermit;
-              sendBudgetState.pendingHopPermit = undefined;
-              sendBudgetState.noteInitialDispatch(prepaid);
-            }
-          }
-        } } : {}),
+        ...thinkingReceipt(request, adapter, recovery),
       }),
       incomingMeta: {
         headers: requestState.selectedForwardHeaders,

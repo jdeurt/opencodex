@@ -441,3 +441,140 @@ describe("Anthropic thinking-signature recovery through Responses dispatch", () 
     expect(bodies[2]).toContain(SIGNATURE);
   });
 });
+
+async function mediaRequest(options: Parameters<typeof handleResponses>[3] = {}) {
+  const source = request(true);
+  const body = await source.json() as Record<string, unknown>;
+  body.tools = [{ type: "image_generation" }];
+  const cfg = config();
+  cfg.images = { bridgeEnabled: true };
+  cfg.providers.xai = { adapter: "openai-chat", baseUrl: "https://api.x.ai/v1", authMode: "key", apiKey: "synthetic-image-key", proxy: "direct" };
+  const log: RequestLogContext = { model: "", provider: "" };
+  const response = await handleResponses(new Request(source.url, {
+    method: "POST", headers: source.headers, body: JSON.stringify(body),
+  }), cfg, log, options);
+  return { response, text: await response.text(), log };
+}
+
+for (const rawSse of [false, true]) {
+  test(`media bridge repairs only the rejected inference (initial SSE=${rawSse})`, async () => {
+    const bodies = fakeUpstream(index => index === 1 ? rawSse ? streamRejection(frame("ping")) : rejection() : success(true));
+    const result = await mediaRequest();
+    expect(result.text).toContain("Recovered answer");
+    expectStrippedRetry(bodies);
+    expect(result.log.activeAttempt?.sendCount).toBe(2);
+  });
+  test(`empty-completion retry shares the original recovery allowance (SSE=${rawSse})`, async () => {
+    const bodies = fakeUpstream(index => index === 1 ? success(true, "")
+      : index === 2 ? rawSse ? streamRejection() : rejection() : success(true));
+    const cfg = config(); cfg.emptyCompletionRetry = true;
+    const response = await handleResponses(request(true), cfg, { model: "", provider: "" });
+    expect(await response.text()).toContain("Recovered answer");
+    expect(bodies).toHaveLength(3);
+    expect(bodies[1]).toContain(SIGNATURE);
+    expect(bodies[2]).not.toContain(SIGNATURE);
+  });
+}
+
+test("media repair never repeats an already executed image tool", async () => {
+  const bodies: string[] = [];
+  let imageCalls = 0;
+  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = input instanceof Request ? input.url : String(input);
+    if (url === "https://api.x.ai/v1/images/generations") {
+      imageCalls++;
+      return Response.json({ error: { message: "Synthetic image refusal" } }, { status: 400 });
+    }
+    if (url !== "https://anthropic.example.test/v1/messages") throw new Error("Unexpected test network target");
+    bodies.push(String(init?.body));
+    if (bodies.length === 1) return sse(
+      frame("message_start", { message: { usage: { input_tokens: 2 } } }),
+      frame("content_block_start", { index: 0, content_block: { type: "tool_use", id: "image_fixture", name: "image_gen", input: {} } }),
+      frame("content_block_delta", { index: 0, delta: { type: "input_json_delta", partial_json: '{"prompt":"fixture"}' } }),
+      frame("content_block_stop", { index: 0 }),
+      frame("message_delta", { delta: { stop_reason: "tool_use" } }), frame("message_stop"));
+    return bodies.length === 2 ? streamRejection() : success(true);
+  }) as typeof fetch;
+  const result = await mediaRequest();
+  expect(result.text).toContain("Recovered answer");
+  expect(imageCalls).toBe(1);
+  expect(bodies).toHaveLength(3);
+  expect(bodies[2]).toContain("image_fixture");
+  expect(bodies[2]).toContain("xAI images API returned 400");
+  expect(bodies[2]).not.toContain(SIGNATURE);
+});
+
+for (const prefix of [textFrame("visible"), frame("content_block_start", {
+  index: 0, content_block: { type: "server_tool_use", id: "effect_fixture", name: "unmodeled" },
+})]) test("media semantic progress fences signature recovery", async () => {
+  const bodies = fakeUpstream(() => streamRejection(prefix));
+  const result = await mediaRequest();
+  expect(result.text).toContain("response.failed");
+  expect(bodies).toHaveLength(1);
+});
+
+test("selective recovery retains earlier rejection memos while accepting new thinking", async () => {
+  const fresh = "SyntheticNewSignature123456==";
+  const newest = "SyntheticNewestSignature123456==";
+  const bodies = fakeUpstream(index => index === 1 || index === 3 ? rejection() : success(false));
+  await send(false);
+  const withFresh = async (signatures: string[]) => {
+    const source = request(false);
+    const body = await source.json() as { input: unknown[] };
+    body.input.splice(body.input.length - 1, 0, ...signatures.map(sig => ({
+      type: "reasoning", encrypted_content: encodeReasoningEnvelope({ sig }),
+    })));
+    return handleResponses(new Request(source.url, { method: "POST", headers: source.headers, body: JSON.stringify(body) }),
+      config(), { model: "", provider: "" });
+  };
+  const second = await withFresh([fresh]);
+  expect(await second.text()).toContain("Recovered answer");
+  expect(bodies[2]).not.toContain(SIGNATURE);
+  expect(bodies[2]).toContain(fresh);
+  expect(bodies[3]).not.toContain(SIGNATURE);
+  expect(bodies[3]).not.toContain(fresh);
+  const third = await withFresh([fresh, newest]);
+  await third.text();
+  expect(bodies).toHaveLength(5);
+  expect(bodies[4]).not.toContain(SIGNATURE);
+  expect(bodies[4]).not.toContain(fresh);
+  expect(bodies[4]).toContain(newest);
+});
+
+test("a memo that already removed every opaque block cannot authorize an identical resend", async () => {
+  const bodies = fakeUpstream(index => index === 2 ? success(false) : rejection());
+  await send(false);
+  const result = await send(false);
+  expect(result.response.status).toBe(400);
+  expect(bodies).toHaveLength(3);
+  expect(bodies[2]).not.toContain(SIGNATURE);
+});
+
+for (const rawSse of [false, true]) test(`media replacement retains structured refusal (SSE=${rawSse})`, async () => {
+  const bodies = fakeUpstream(index => index === 1 ? rawSse ? streamRejection() : rejection()
+    : Response.json({ error: { type: "permission_error", code: "fixture_denied", message: "Synthetic refusal" } }, { status: 403 }));
+  const result = await mediaRequest();
+  if (rawSse) expect(streamedFailure(result.text).error).toMatchObject({ type: "permission_error", code: "fixture_denied" });
+  else {
+    expect(result.response.status).toBe(403);
+    expect(JSON.parse(result.text).error).toMatchObject({ type: "permission_error", code: "fixture_denied" });
+  }
+  expect(bodies).toHaveLength(2);
+});
+
+for (const rawSse of [false, true]) test(`media recovery honors shared exhaustion and cancellation (SSE=${rawSse})`, async () => {
+  const budget = createRequestExecutionBudget({ maxTotalModelSends: 1, baseSendAllowance: 1,
+    finalRecoveryAllowance: 0, maxAlternateTargetSends: 0, maxTargetTransitions: 0 }, "media-recovery-budget");
+  const bodies = fakeUpstream(() => rawSse ? streamRejection() : rejection());
+  await mediaRequest({ sendBudget: budget });
+  expect(bodies).toHaveLength(1);
+  expect(budget.used).toBe(1);
+  const abort = new AbortController();
+  const cancelledBodies = fakeUpstream(() => {
+    abort.abort();
+    return rawSse ? streamRejection() : rejection();
+  });
+  const result = await mediaRequest({ abortSignal: abort.signal });
+  expect(result.text).not.toContain("Recovered answer");
+  expect(cancelledBodies).toHaveLength(1);
+});
