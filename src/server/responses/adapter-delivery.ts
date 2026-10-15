@@ -27,6 +27,7 @@ import { readDisplaySafeErrorText, normalizeUpstreamErrorText } from "./core-err
 import { sanitizeNonReplayableUpstreamError } from "./non-replayable-error";
 import { isNonReplayableResponse } from "../../lib/upstream-retry";
 import { isCanonicalOpenAiForwardProvider } from "../../providers/openai-tiers";
+import { guardEmptyToolCatalogEvents, guardEmptyToolCatalogStream } from "../../lib/empty-tool-catalog";
 
 /** One responsibility of the Responses request pipeline; state owners are explicit. */
 export async function deliverAdapterResponse(
@@ -37,6 +38,7 @@ export async function deliverAdapterResponse(
     | "route"
     | "translatorBudget"
     | "toolBridgeMaps"
+    | "clientToolCatalogRestriction"
     | "rememberKiroDeliveredFinalAnswer"
     | "responseStateOptions"
   >,
@@ -115,6 +117,10 @@ export async function deliverAdapterResponse(
       }
     }, () => transportState.activeAdapter.name, !isNonReplayableResponse(upstreamResponse), upstreamResponse);
 
+  const clientToolCatalog = requestState.clientToolCatalogRestriction && route.provider.authMode !== "forward"
+    ? requestState.clientToolCatalogRestriction : undefined;
+  const deliveryToolBridgeMaps = clientToolCatalog
+    ? { ...toolBridgeMaps, ...clientToolCatalog } : toolBridgeMaps;
 
 
   if (parsed.stream) {
@@ -170,13 +176,14 @@ export async function deliverAdapterResponse(
     // turn with no text and no tool call is retried with the IDENTICAL request
     // (fetchTerminalGuardContinuation(parsed) replays the cached byte-identical
     // request — same body, same headers, same signal).
-    const guardedEventStream = emptyCompletionGuardEnabled
+    const completionGuardedEventStream = emptyCompletionGuardEnabled
       ? guardEmptyCompletionEventStream({
           firstEvents: advisorStream,
           continuation: fetchGuardedEmptyCompletionRetry,
         })
       : advisorStream;
-    const { toolNsMap, declaredToolNames, toolParameterSchemas, freeformToolNames, bareCustomToolNames, toolSearchToolNames } = toolBridgeMaps;
+    const guardedEventStream = guardEmptyToolCatalogStream(completionGuardedEventStream, clientToolCatalog, translatorBudget);
+    const { toolNsMap, declaredToolNames, toolParameterSchemas, freeformToolNames, bareCustomToolNames, toolSearchToolNames } = deliveryToolBridgeMaps;
     // One completion owner for both deliveries: the bridge calls it from its terminal, the
     // direct client encoder from the fold of the same events.
     const onCompletedResponse = (response: Record<string, unknown>, providerState?: OcxProviderContinuationState) => {
@@ -199,7 +206,9 @@ export async function deliverAdapterResponse(
       }
       notifyResponseComplete(response);
     };
-    const clientEncoder = clientEncoderForDelivery(options, logCtx, !!routedCompaction, transportState.activeAdapter.name);
+    // The Responses bridge owns code-mode helper compilation; the direct encoder only renames.
+    const clientEncoder = clientToolCatalog?.bareCustomToolNames.has("exec") ? undefined
+      : clientEncoderForDelivery(options, logCtx, !!routedCompaction, transportState.activeAdapter.name);
     if (clientEncoder) {
       return deliverClientEncodedResponse({
         encoder: clientEncoder,
@@ -325,8 +334,9 @@ export async function deliverAdapterResponse(
     } finally {
       cleanupUpstreamAbort();
     }
-    const { toolNsMap, declaredToolNames, toolParameterSchemas, freeformToolNames, bareCustomToolNames, toolSearchToolNames } = toolBridgeMaps;
+    const { toolNsMap, declaredToolNames, toolParameterSchemas, freeformToolNames, bareCustomToolNames, toolSearchToolNames } = deliveryToolBridgeMaps;
     let providerState: OcxProviderContinuationState | undefined;
+    events = guardEmptyToolCatalogEvents(events, clientToolCatalog, translatorBudget);
     const json = buildResponseJSON(events, parsed._responseModelId ?? parsed.modelId, {
       translatorBudget,
       replayCacheScope: parsed._reasoningReplayScope,
